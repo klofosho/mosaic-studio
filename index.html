@@ -132,6 +132,8 @@ select{width:100%;padding:4px 7px;border-radius:var(--r);border:1px solid var(--
 .tog-v::after{content:'';position:absolute;width:8px;height:8px;background:var(--dim);border-radius:50%;top:2px;left:2px;transition:all .15s}
 input[type=checkbox]:checked+.tog-v{background:rgba(255,109,58,.2);border-color:var(--warm)}
 input[type=checkbox]:checked+.tog-v::after{transform:translateX(12px);background:var(--warm)}
+#hard-erase:checked+.tog-v{background:rgba(245,85,85,.2);border-color:var(--red)}
+#hard-erase:checked+.tog-v::after{background:var(--red)}
 .tog-inp{opacity:0;width:0;height:0;position:absolute}
 /* Save modal */
 #save-modal{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:100;display:none;align-items:center;justify-content:center}
@@ -154,6 +156,14 @@ input[type=checkbox]:checked+.tog-v::after{transform:translateX(12px);background
 <!-- TOP BAR -->
 <div id="tb">
   <div class="logo">MOSAIC<em>STUDIO</em></div>
+  <div id="active-layer-pill" style="
+    display:flex;align-items:center;gap:6px;padding:3px 10px;
+    border-radius:12px;background:rgba(255,109,58,.12);border:1px solid rgba(255,109,58,.35);
+    font:700 9px/1 'Syne',sans-serif;color:var(--warm);flex-shrink:0;letter-spacing:.07em;
+    max-width:160px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">
+    <span style="opacity:.6">LAYER:</span>
+    <span id="active-layer-name">—</span>
+  </div>
   <div class="sep"></div>
   <button class="vtog on" id="v-orig" onclick="toggleView('orig',this)">ORIG</button>
   <button class="vtog on" id="v-layers" onclick="toggleView('layers',this)">DENSITY</button>
@@ -203,6 +213,8 @@ input[type=checkbox]:checked+.tog-v::after{transform:translateX(12px);background
     <div class="sr" id="grad-dist-row" style="display:none">
       <label>Falloff <span class="v" id="v-gd">Linear</span></label>
       <input type="range" class="p" min="1" max="50" value="10" oninput="S.gradFalloff=+this.value;setv('v-gd',this.value<8?'Sharp':this.value<15?'Linear':this.value<25?'Smooth':'Soft')"></div>
+    <div class="tog-w" style="margin-top:2px"><span class="lbl" style="color:var(--red)">Hard Erase (instant)</span>
+        <label><input class="tog-inp" type="checkbox" id="hard-erase" onchange="S.hardErase=this.checked"><span class="tog-v" style=""></span></label></div>
     <div id="vel-rows">
       <div class="tog-w"><span class="lbl">Velocity→Density</span>
         <label><input class="tog-inp" type="checkbox" id="vel-d" onchange="S.velDensity=this.checked"><span class="tog-v"></span></label></div>
@@ -363,7 +375,7 @@ const S = {
   bgMask:null,
   layers:[], activeId:null, lctr:0,
   tool:'paint',
-  bSize:20, bStrength:0.5, velDensity:false, velSize:false,
+  bSize:20, bStrength:0.5, velDensity:false, velSize:false, hardErase:false, selDashOffset:0,
   gradMode:'linear', gradFalloff:10,
   gradStart:null, gradDragging:false,
   selectRect:null, selectedPins:[],
@@ -493,11 +505,21 @@ function newLayer(name,type){
 function addPaintLayer(name){
   const l=newLayer(name||`Layer ${S.layers.length+1}`,'paint');
   S.layers.push(l); S.activeId=l.id;
-  updateLayersList(); setv('s-lyrs',S.layers.length); return l;
+  updateLayersList(); setv('s-lyrs',S.layers.length);
+  updateActiveLayerPill(); return l;
 }
 function getActive(){ return S.layers.find(l=>l.id===S.activeId)||null; }
 function toggleVis(id){ const l=S.layers.find(l=>l.id===id); if(l){l.visible=!l.visible;S.pinsStale=true;updateLayersList();renderCanvas();} }
-function setActiveLayer(id){ S.activeId=id; updateLayersList(); }
+function setActiveLayer(id){
+  S.activeId=id;
+  updateLayersList();
+  updateActiveLayerPill();
+}
+function updateActiveLayerPill(){
+  const l=getActive();
+  const pill=document.getElementById('active-layer-name');
+  if(pill) pill.textContent=l?l.name:'—';
+}
 function deleteLayer(id){
   const idx=S.layers.findIndex(l=>l.id===id); if(idx<0) return;
   S.layers.splice(idx,1);
@@ -516,6 +538,7 @@ function updateLayersList(){
     d.onclick=()=>setActiveLayer(l.id);
     el.appendChild(d);
   });
+  updateActiveLayerPill();
 }
 
 // ═══════════════════════════════════════════════
@@ -581,23 +604,27 @@ function densityPaint(layer,cx,cy,radius,strength,angle,vel){
   layer.densCanvasDirty=true; layer.pinsStale=true; S.pinsStale=true;
 }
 
-// ERASE: subtract density with soft falloff; one full pass zeros center completely.
-// Works on paint AND Sobel layers because it operates on the raw Float32 density array.
+// ERASE: soft falloff subtract, or instant zero if S.hardErase is on.
+// Hard erase is essential for Sobel layers where density peaks at 1.0 on edges.
 function densityErase(layer,cx,cy,radius,strength){
-  const W=layer.densCanvas.width,H=layer.densCanvas.height;
+  const W=layer.densCanvas.width, H=layer.densCanvas.height;
   const r=Math.ceil(radius);
-  // Use a strong step so a single brush pass visibly clears — 0.8 means center is
-  // fully wiped in ~2 overlapping strokes regardless of original density value.
-  const step=clamp(strength*0.8, 0.15, 1.0);
-  for(let dy=-r;dy<=r;dy++){
-    for(let dx=-r;dx<=r;dx++){
+  for(let dy=-r; dy<=r; dy++){
+    for(let dx=-r; dx<=r; dx++){
       const px=Math.round(cx+dx), py=Math.round(cy+dy);
       if(px<0||py<0||px>=W||py>=H) continue;
       const d=dist2(dx,dy);
       if(d>radius) continue;
-      const t=1-d/radius;
       const idx=py*W+px;
-      layer.density[idx]=clamp(layer.density[idx]-t*t*step, 0, 1);
+      if(S.hardErase){
+        // Hard mode: instantly zero everything inside radius
+        layer.density[idx]=0;
+      } else {
+        // Soft mode: quadratic falloff subtraction, strong enough to clear in 1-2 passes
+        const t=1-d/radius;
+        const step=clamp(strength*0.9, 0.2, 1.0);
+        layer.density[idx]=clamp(layer.density[idx]-t*t*step, 0, 1);
+      }
     }
   }
   layer.densCanvasDirty=true; layer.pinsStale=true; S.pinsStale=true;
@@ -849,19 +876,43 @@ function renderCanvas(){
     for(const pin of S.allPins) drawGlyph(ctx,pin,1);
   }
 
-  // 5. Selection rect
+  // 5. Selection rect — drawn here for the main canvas view
   if(S.tool==='select'&&S.selectRect){
     const r=S.selectRect;
-    ctx.strokeStyle='rgba(0,200,215,.85)'; ctx.lineWidth=1;
-    ctx.setLineDash([4,4]); ctx.strokeRect(r.x,r.y,r.w,r.h); ctx.setLineDash([]);
-    ctx.globalAlpha=0.9;
-    for(const pin of S.selectedPins){
-      ctx.strokeStyle='gold'; ctx.lineWidth=1.5;
-      ctx.beginPath(); ctx.arc(pin.x,pin.y,pin.size*.8,0,Math.PI*2); ctx.stroke();
+    // Fill tint
+    ctx.fillStyle='rgba(0,200,215,.07)';
+    ctx.fillRect(r.x,r.y,r.w,r.h);
+    // Animated dash offset stored on S
+    const dash=((S.selDashOffset||0));
+    ctx.strokeStyle='rgba(0,200,215,.95)'; ctx.lineWidth=1.5/S.zoom;
+    ctx.setLineDash([6/S.zoom,3/S.zoom]);
+    ctx.lineDashOffset=-dash/S.zoom;
+    ctx.strokeRect(r.x,r.y,r.w,r.h);
+    ctx.setLineDash([]); ctx.lineDashOffset=0;
+    // Corner handles
+    const hs=5/S.zoom;
+    [[r.x,r.y],[r.x+r.w,r.y],[r.x,r.y+r.h],[r.x+r.w,r.y+r.h]].forEach(([hx,hy])=>{
+      ctx.fillStyle='#00c8d7'; ctx.fillRect(hx-hs/2,hy-hs/2,hs,hs);
+    });
+    // Selected pin highlights
+    if(S.selectedPins.length>0){
+      ctx.strokeStyle='#ffd700'; ctx.lineWidth=1.5/S.zoom;
+      for(const pin of S.selectedPins){
+        ctx.beginPath(); ctx.arc(pin.x,pin.y,pin.size+3/S.zoom,0,Math.PI*2); ctx.stroke();
+      }
     }
-    ctx.globalAlpha=1;
   }
 }
+
+// Animate selection dash — called on rAF when select tool active
+function animateSelection(){
+  if(S.tool==='select'&&S.selectRect){
+    S.selDashOffset=(S.selDashOffset||0)+0.5;
+    renderCanvas();
+  }
+  requestAnimationFrame(animateSelection);
+}
+requestAnimationFrame(animateSelection);
 
 // ═══════════════════════════════════════════════
 //  OVERLAY CANVAS (gradient preview)
@@ -1108,13 +1159,19 @@ function onKey(e){
 function deleteSelectedPins(){
   if(!S.selectedPins.length) return;
   pushUndo('Delete Pins');
+  // Force hard-erase mode temporarily so selected pins are always fully removed
+  const prevHard=S.hardErase; S.hardErase=true;
   S.selectedPins.forEach(pin=>{
     const l=S.layers.find(l=>l.id===pin.layerId);
-    if(l) densityErase(l,pin.x,pin.y,S.gridSp*1.5,1.0);
+    if(!l) return;
+    // Erase with radius = gridSpacing so we clear the full cell around the pin
+    densityErase(l, pin.x, pin.y, Math.max(S.gridSp, pin.size*2), 1.0);
   });
+  S.hardErase=prevHard;
   S.layers.forEach(l=>{ if(l.densCanvasDirty) regenDensCanvas(l); });
   S.selectedPins=[]; S.selectRect=null;
-  computeAllPins(); document.getElementById('sel-info-box').style.display='none';
+  computeAllPins();
+  document.getElementById('sel-info-box').style.display='none';
   addHist('Delete Pins','✕'); updateHistoryList(); updateUndoButtons(); renderCanvas();
 }
 function updateCursorRing(){
